@@ -1,0 +1,297 @@
+import os
+import sys
+import getpass
+import hashlib
+import subprocess
+import hmac
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import utils as asymmetric_utils
+from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+
+# Constants for encryption
+SALT_LENGTH = 512
+NONCE_LENGTH = 12
+KEY_LENGTH = 32
+TAG_LENGTH = 16
+
+def derive_key(password, salt):
+    # Derive key using Scrypt key derivation function
+    kdf = Scrypt(salt=salt, length=KEY_LENGTH, n=2**20, r=8, p=1)
+    key = kdf.derive(password.encode())
+    return key
+
+def hash_password(password):
+    # Hash password using SHA3-512
+    digest = hashlib.sha3_512()
+    digest.update(password.encode('utf-8'))
+    return digest.digest()
+
+def generate_ec_key():
+    # Generate EC key pair
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    return private_key
+
+def export_private_key(private_key, file_path, passphrase):
+    # Encrypt and export private key to file
+    encrypted_private_key = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.BestAvailableEncryption(hashlib.sha256(passphrase.encode('utf-8')).digest())
+    )
+
+    try:
+        with open(file_path, 'wb') as file:
+            file.write(encrypted_private_key)
+    except IOError:
+        print(f'Error: Failed to write the private key file: {file_path}')
+        return
+
+    print(f'Successfully exported private key to: {file_path}')
+
+def import_private_key(file_path, passphrase):
+    # Read the encrypted private key from the file
+    try:
+        with open(file_path, 'rb') as file:
+            encrypted_private_key = file.read()
+    except IOError:
+        print(f'Error: Failed to read the private key file: {file_path}')
+        return None
+
+    # Decrypt the private key with the passphrase
+    private_key = serialization.load_pem_private_key(
+        encrypted_private_key,
+        password=passphrase.encode('utf-8')
+    )
+
+    return private_key
+
+def encrypt_file(file_path, private_key, password, algorithm='ChaCha20Poly1305'):
+    # Generate random salt and nonce
+    salt = os.urandom(SALT_LENGTH)
+    nonce = os.urandom(NONCE_LENGTH)
+
+    # Derive encryption key
+    key = derive_key(password, salt)
+
+    # Read plaintext file
+    try:
+        with open(file_path, 'rb') as file:
+            plaintext = file.read()
+    except IOError:
+        print(f'Error: Failed to read the file: {file_path}')
+        return
+
+    # Encrypt plaintext
+    if algorithm == 'ChaCha20Poly1305':
+        cipher = ChaCha20Poly1305(key)
+    elif algorithm == 'AESGCM':
+        cipher = AESGCM(key)
+    else:
+        print(f'Error: Invalid encryption algorithm: {algorithm}')
+        return
+
+    try:
+        ciphertext = cipher.encrypt(nonce, plaintext, None)
+    except Exception as e:
+        print(f'Error: Failed to encrypt the file: {file_path}')
+        print(f'Exception: {str(e)}')
+        return
+
+    # Create output file paths
+    output_file = f'{file_path}.enc'
+    key_file = f'{file_path}.key'
+
+    # Write encrypted file
+    try:
+        with open(output_file, 'wb') as file:
+            file.write(salt)
+            file.write(nonce)
+            file.write(ciphertext)
+    except IOError:
+        print(f'Error: Failed to write the encrypted file: {output_file}')
+        return
+
+    # Write key file
+    try:
+        with open(key_file, 'wb') as file:
+            file.write(salt)
+            file.write(derive_key(password, salt))
+    except IOError:
+        print(f'Error: Failed to write the key file: {key_file}')
+        return
+
+    # Delete the original file
+    try:
+        os.remove(file_path)
+    except OSError:
+        print(f'Warning: Failed to delete the original file: {file_path}')
+
+    print(f'Successfully encrypted: {file_path}')
+    print(f'Encrypted file saved as: {output_file}')
+    print(f'Key file saved as: {key_file}')
+
+def decrypt_file(file_path, private_key, password, algorithm='ChaCha20Poly1305'):
+    # Read encrypted file
+    try:
+        with open(file_path, 'rb') as file:
+            salt = file.read(SALT_LENGTH)
+            nonce = file.read(NONCE_LENGTH)
+            ciphertext = file.read()
+    except IOError:
+        print(f'Error: Failed to read the file: {file_path}')
+        return
+
+    # Derive decryption key
+    key = derive_key(password, salt)
+
+    # Decrypt ciphertext
+    if algorithm == 'ChaCha20Poly1305':
+        cipher = ChaCha20Poly1305(key)
+    elif algorithm == 'AESGCM':
+        cipher = AESGCM(key)
+    else:
+        print(f'Error: Invalid encryption algorithm: {algorithm}')
+        return
+
+    try:
+        plaintext = cipher.decrypt(nonce, ciphertext, None)
+    except Exception as e:
+        print(f'Error: Failed to decrypt the file: {file_path}')
+        print(f'Exception: {str(e)}')
+        return
+
+    # Verify the key contents
+    decrypted_key = plaintext[:KEY_LENGTH]
+    derived_key = derive_key(password, salt)
+    if decrypted_key != derived_key:
+        print(f'Error: Key contents do not match.')
+        return
+
+    # Create output file path
+    output_file = file_path.rsplit('.enc', 1)[0]
+
+    # Write decrypted file
+    try:
+        with open(output_file, 'wb') as file:
+            file.write(plaintext[KEY_LENGTH:])
+    except IOError:
+        print(f'Error: Failed to write the decrypted file: {output_file}')
+        return
+
+    # Delete the encrypted file
+    try:
+        os.remove(file_path)
+    except OSError:
+        print(f'Warning: Failed to delete the encrypted file: {file_path}')
+
+    print(f'Successfully decrypted: {file_path}')
+    print(f'Decrypted file saved as: {output_file}')
+
+def encrypt_directory(directory_path, private_key, password, algorithm='ChaCha20Poly1305'):
+    try:
+        for root, _, files in os.walk(directory_path):
+            for file_name in files:
+                file_path = os.path.join(root, file_name)
+                encrypt_file(file_path, private_key, password, algorithm)
+    except Exception as e:
+        print(f'Error: Failed to encrypt directory: {directory_path}')
+        print(f'Exception: {str(e)}')
+
+def decrypt_directory(directory_path, private_key, password, algorithm='ChaCha20Poly1305'):
+    try:
+        for root, _, files in os.walk(directory_path):
+            for file_name in files:
+                if file_name.endswith('.enc'):
+                    file_path = os.path.join(root, file_name)
+                    decrypt_file(file_path, private_key, password, algorithm)
+                    key_file_path = file_path.rsplit('.enc', 1)[0] + '.key'
+                    verify_key_contents(key_file_path, password)
+    except Exception as e:
+        print(f'Error: Failed to decrypt directory: {directory_path}')
+        print(f'Exception: {str(e)}')
+
+def verify_key_contents(key_file_path, password):
+    # Read the key file
+    try:
+        with open(key_file_path, 'rb') as file:
+            key_contents = file.read()
+    except IOError:
+        print(f'Error: Failed to read the key file: {key_file_path}')
+        return
+
+    # Derive the key using the provided password
+    derived_key = derive_key(password, key_contents[:SALT_LENGTH])
+
+    # Verify the key contents
+    if key_contents[SALT_LENGTH:SALT_LENGTH + KEY_LENGTH] != derived_key:
+        print(f'Error: Key contents do not match for file: {key_file_path}')
+        return
+
+    print(f'Key contents verified for file: {key_file_path}')
+
+def main():
+    print('Welcome to File Encryption Utility!')
+    print('Please choose an option:')
+    print('1. Generate new EC key pair')
+    print('2. Import EC private key')
+    print('3. Encrypt a file')
+    print('4. Decrypt a file')
+    print('5. Encrypt a directory')
+    print('6. Decrypt a directory')
+    choice = input('Enter your choice (1-6): ')
+
+    if choice == '1':
+        private_key = generate_ec_key()
+        passphrase = getpass.getpass('Enter passphrase for the private key: ')
+        file_path = input('Enter the file path to export the private key: ')
+        export_private_key(private_key, file_path, passphrase)
+    elif choice == '2':
+        file_path = input('Enter the file path to import the private key: ')
+        passphrase = getpass.getpass('Enter passphrase for the private key: ')
+        private_key = import_private_key(file_path, passphrase)
+        if private_key:
+            print('Successfully imported private key.')
+    elif choice == '3':
+        file_path = input('Enter the file path to encrypt: ')
+        passphrase = getpass.getpass('Enter passphrase for encryption: ')
+        private_key_file = input('Enter the file path of the private key: ')
+        private_key_passphrase = getpass.getpass('Enter passphrase for the private key: ')
+        private_key = import_private_key(private_key_file, private_key_passphrase)
+        if private_key:
+            encrypt_file(file_path, private_key, passphrase)
+    elif choice == '4':
+        file_path = input('Enter the file path to decrypt: ')
+        passphrase = getpass.getpass('Enter passphrase for decryption: ')
+        private_key_file = input('Enter the file path of the private key: ')
+        private_key_passphrase = getpass.getpass('Enter passphrase for the private key: ')
+        private_key = import_private_key(private_key_file, private_key_passphrase)
+        if private_key:
+            decrypt_file(file_path, private_key, passphrase)
+    elif choice == '5':
+        directory_path = input('Enter the directory path to encrypt: ')
+        passphrase = getpass.getpass('Enter passphrase for encryption: ')
+        private_key_file = input('Enter the file path of the private key: ')
+        private_key_passphrase = getpass.getpass('Enter passphrase for the private key: ')
+        private_key = import_private_key(private_key_file, private_key_passphrase)
+        if private_key:
+            encrypt_directory(directory_path, private_key, passphrase)
+    elif choice == '6':
+        directory_path = input('Enter the directory path to decrypt: ')
+        passphrase = getpass.getpass('Enter passphrase for decryption: ')
+        private_key_file = input('Enter the file path of the private key: ')
+        private_key_passphrase = getpass.getpass('Enter passphrase for the private key: ')
+        private_key = import_private_key(private_key_file, private_key_passphrase)
+        if private_key:
+            decrypt_directory(directory_path, private_key, passphrase)
+    else:
+        print('Invalid choice.')
+
+if __name__ == '__main__':
+    main()
